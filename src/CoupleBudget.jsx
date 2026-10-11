@@ -28,6 +28,16 @@ import {
   User,
   Users,
   Wallet,
+  Check,
+  Download,
+  FileJson,
+  FileSpreadsheet,
+  FolderOpen,
+  Printer,
+  Save,
+  Share2,
+  Upload,
+  X,
 } from 'lucide-react';
 
 /* ============================================================================
@@ -40,6 +50,7 @@ import {
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY = 'couple-budget-v1';
+const SCENARIOS_KEY = 'couple-budget-scenarios-v1';
 const RENT_MIN = 1800;
 const RENT_MAX = 4500;
 const LANDLORD_MULTIPLE = 40;
@@ -132,24 +143,191 @@ const fmtSigned = (n) => `${n >= 0 ? '+' : '−'}${usd0.format(Math.abs(Math.rou
 const pct = (n, digits = 1) => `${((n || 0) * 100).toFixed(digits)}%`;
 const pctSigned = (n, digits = 1) => `${n >= 0 ? '+' : '−'}${Math.abs((n || 0) * 100).toFixed(digits)} pts`;
 
-function loadState() {
+/** Merge a saved/imported state over the defaults so older or partial files still load. */
+function normalizeState(saved) {
   const defaults = makeDefaults();
+  if (!saved || typeof saved !== 'object') return defaults;
+  return {
+    ...defaults,
+    ...saved,
+    names: { ...defaults.names, ...saved.names },
+    income: { ...defaults.income, ...saved.income },
+    targets: { ...defaults.targets, ...saved.targets },
+    personal: { ...defaults.personal, ...saved.personal },
+    shared: Array.isArray(saved.shared) ? saved.shared : defaults.shared,
+  };
+}
+
+function loadState() {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaults;
-    const saved = JSON.parse(raw);
-    return {
-      ...defaults,
-      ...saved,
-      names: { ...defaults.names, ...saved.names },
-      income: { ...defaults.income, ...saved.income },
-      targets: { ...defaults.targets, ...saved.targets },
-      personal: { ...defaults.personal, ...saved.personal },
-      shared: Array.isArray(saved.shared) ? saved.shared : defaults.shared,
-    };
+    return raw ? normalizeState(JSON.parse(raw)) : makeDefaults();
   } catch {
-    return defaults;
+    return makeDefaults();
   }
+}
+
+function loadScenarios() {
+  try {
+    const list = JSON.parse(window.localStorage.getItem(SCENARIOS_KEY) || '[]');
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Save / export helpers
+// ---------------------------------------------------------------------------
+
+const EXPORT_APP = 'couple-budget';
+const EXPORT_VERSION = 1;
+
+/** Accepts either a full export envelope or a bare state object. Throws if it doesn't look like ours. */
+function parseImport(text) {
+  const parsed = JSON.parse(text);
+  const data = parsed && parsed.app === EXPORT_APP ? parsed.state : parsed;
+  if (!data || typeof data !== 'object' || !data.income || !Array.isArray(data.shared)) {
+    throw new Error('This file is not a Couple Budget backup.');
+  }
+  return {
+    state: normalizeState(data),
+    scenarios: parsed && Array.isArray(parsed.scenarios) ? parsed.scenarios : null,
+  };
+}
+
+function downloadFile(filename, content, type) {
+  const url = URL.createObjectURL(new Blob([content], { type }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+const dateStamp = () => new Date().toISOString().slice(0, 10);
+
+function clearHash() {
+  try {
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Share links carry the whole state in the URL hash (never sent to a server).
+const encodeShare = (state) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(state));
+  let bin = '';
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+const decodeShare = (str) => {
+  const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
+};
+
+function buildCsv(state, m) {
+  const n1 = state.names.p1 || 'Partner 1';
+  const n2 = state.names.p2 || 'Partner 2';
+  const cell = (v) => {
+    const s = typeof v === 'number' ? v.toFixed(2) : String(v ?? '');
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const rows = [['Section', 'Line item', 'Category', 'Monthly', n1, n2]];
+  m.shared.forEach((i) =>
+    rows.push(['Shared', i.name, CAT_META[i.category].label, i.amount, i.amount * m.p1Share, i.amount * m.p2Share])
+  );
+  rows.push(['Shared', 'TOTAL JOINT TRANSFER', '', m.sharedTotal, m.p1.transfer, m.p2.transfer]);
+  rows.push([]);
+  [
+    ['p1', n1],
+    ['p2', n2],
+  ].forEach(([k, name]) => {
+    state.personal[k].forEach((i) => rows.push([`${name} personal`, i.name, CAT_META[i.category].label, i.amount]));
+    rows.push([`${name} personal`, 'TOTAL', '', m[k].personalTotal]);
+  });
+  rows.push([]);
+  rows.push(['Summary', 'Metric', '', 'Household', n1, n2]);
+  [
+    ['Net take-home / mo', m.combinedNet, m.p1.net, m.p2.net],
+    ['Split share', '', `${(m.p1Share * 100).toFixed(1)}%`, `${(m.p2Share * 100).toFixed(1)}%`],
+    ['Joint transfer / mo', m.sharedTotal, m.p1.transfer, m.p2.transfer],
+    ['Personal budget / mo', m.p1.personalTotal + m.p2.personalTotal, m.p1.personalTotal, m.p2.personalTotal],
+    ['Unallocated buffer / mo', m.surplus, m.p1.buffer, m.p2.buffer],
+    ['Rent', state.rent],
+    ['Utilities (burden calc)', state.utilities],
+    ['Housing net burden', `${(m.burden * 100).toFixed(1)}%`],
+    ['40x rent ceiling', m.ceiling40],
+    ['Split mode', state.splitMode === 'equal' ? '50/50' : 'Proportional'],
+    ['Commission included', state.includeCommission ? 'Yes' : 'No'],
+    ['Bonus included', state.includeBonus ? 'Yes' : 'No'],
+  ].forEach(([label, ...vals]) => rows.push(['Summary', label, '', ...vals]));
+  rows.push([]);
+  rows.push(['50/30/20', 'Category', 'Target %', 'Target $', 'Allocated $', 'Actual %']);
+  m.rule.forEach((r) =>
+    rows.push(['50/30/20', CAT_META[r.key].label, `${r.pctTarget}%`, r.target, r.allocated, `${(r.pctActual * 100).toFixed(1)}%`])
+  );
+  return rows.map((r) => r.map(cell).join(',')).join('\n');
+}
+
+/** A light, print-friendly HTML report (the app itself is dark-themed, which prints poorly). */
+function buildReportHtml(state, m) {
+  const n1 = state.names.p1 || 'Partner 1';
+  const n2 = state.names.p2 || 'Partner 2';
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+  const tr = (cells, tag = 'td') => `<tr>${cells.map((c) => `<${tag}>${esc(c)}</${tag}>`).join('')}</tr>`;
+  const sharedRows = m.shared
+    .map((i) => tr([i.name, CAT_META[i.category].label, fmt(i.amount), fmt(i.amount * m.p1Share), fmt(i.amount * m.p2Share)]))
+    .join('');
+  const personal = (k, name) =>
+    `<h3>${esc(name)} — personal</h3><table>${tr(['Line item', 'Category', 'Monthly'], 'th')}${state.personal[k]
+      .map((i) => tr([i.name, CAT_META[i.category].label, fmt(i.amount)]))
+      .join('')}${tr(['Total', '', fmt(m[k].personalTotal)], 'th')}</table>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Couple Budget — ${dateStamp()}</title>
+<style>
+body{font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif;color:#0f172a;margin:32px;max-width:820px}
+h1{font-size:22px;margin:0}h2{font-size:15px;margin:28px 0 8px;border-bottom:2px solid #e2e8f0;padding-bottom:4px}
+h3{font-size:13px;margin:16px 0 6px}.muted{color:#64748b}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:16px}
+.kpi{border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px}.kpi b{display:block;font-size:17px}
+table{width:100%;border-collapse:collapse}td,th{padding:4px 6px;border-bottom:1px solid #f1f5f9;text-align:left}
+td:nth-child(n+3),th:nth-child(n+3){text-align:right}th{background:#f8fafc}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media print{body{margin:12mm}}
+</style></head><body>
+<h1>Couple Budget &amp; Rent Affordability</h1>
+<div class="muted">${esc(n1)} &amp; ${esc(n2)} · generated ${new Date().toLocaleDateString()}</div>
+<div class="kpis">
+<div class="kpi">Rent<b>${fmt(state.rent)}</b></div>
+<div class="kpi">Housing burden<b>${pct(m.burden)}</b>${BURDEN_META[m.burdenTier].label}</div>
+<div class="kpi">40x ceiling<b>${fmt(m.ceiling40)}</b>${m.passes40 ? 'Approval verified' : 'Below 40x'}</div>
+<div class="kpi">Household surplus<b>${fmtSigned(m.surplus)}</b>per month</div>
+</div>
+<h2>Cash flow</h2><table>
+${tr(['', '', n1, n2], 'th')}
+${tr(['Net take-home', '', fmt(m.p1.net), fmt(m.p2.net)])}
+${tr(['Split share', '', pct(m.p1Share), pct(m.p2Share)])}
+${tr(['Joint transfer', '', fmt(m.p1.transfer), fmt(m.p2.transfer)])}
+${tr(['Personal budget', '', fmt(m.p1.personalTotal), fmt(m.p2.personalTotal)])}
+${tr(['Unallocated buffer', '', fmtSigned(m.p1.buffer), fmtSigned(m.p2.buffer)], 'th')}
+</table>
+<p class="muted">Split mode: ${state.splitMode === 'equal' ? '50 / 50' : 'proportional to net income'} · commission ${
+    state.includeCommission ? 'included' : 'held out'
+  } · bonus ${state.includeBonus ? 'included' : 'not budgeted'}</p>
+<h2>Shared joint account</h2><table>
+${tr(['Line item', 'Category', 'Monthly', n1, n2], 'th')}${sharedRows}
+${tr(['Total', '', fmt(m.sharedTotal), fmt(m.p1.transfer), fmt(m.p2.transfer)], 'th')}</table>
+<h2>Personal budgets</h2><div class="cols"><div>${personal('p1', n1)}</div><div>${personal('p2', n2)}</div></div>
+<h2>50 / 30 / 20 check</h2><table>
+${tr(['Category', 'Target %', 'Target', 'Allocated', 'Actual %'], 'th')}
+${m.rule.map((r) => tr([CAT_META[r.key].label, `${r.pctTarget}%`, fmt(r.target), fmt(r.allocated), pct(r.pctActual)])).join('')}
+</table>
+<p class="muted" style="margin-top:24px">Estimates only. Net figures use the entered deduction percentages, not a full tax calculation.</p>
+<script>window.onload=()=>setTimeout(()=>window.print(),250)</script>
+</body></html>`;
 }
 
 /** Linked 3-way sliders: set one key, redistribute the remainder proportionally across the other two. */
@@ -551,6 +729,243 @@ const BURDEN_META = {
 
 const PERSONAL_ICONS = { car: Car, coffee: Coffee, sparkles: Sparkles, palette: Palette, trending: TrendingUp };
 
+/** Modal for saved scenarios, backup files, CSV, print report and share links. */
+function DataPanel({
+  state,
+  scenarios,
+  onClose,
+  onSave,
+  onLoad,
+  onOverwrite,
+  onDelete,
+  onRename,
+  onExportJson,
+  onImportJson,
+  onExportCsv,
+  onPrint,
+  onCopyLink,
+}) {
+  const [name, setName] = useState('');
+  const fileRef = React.useRef(null);
+  const current = useMemo(() => computeModel(state), [state]);
+
+  useEffect(() => {
+    const onKey = (e) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const ActionButton = ({ icon: Icon, title, desc, onClick }) => (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-start gap-3 rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-left transition hover:border-indigo-500/50 hover:bg-indigo-500/[0.06]"
+    >
+      <div className="rounded-lg bg-slate-800 p-2 text-indigo-300">
+        <Icon size={16} />
+      </div>
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-slate-100">{title}</div>
+        <div className="text-xs text-slate-400">{desc}</div>
+      </div>
+    </button>
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/80 p-4 backdrop-blur-sm sm:items-center">
+      <div className="absolute inset-0" onClick={onClose} aria-hidden="true" />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Save and export"
+        className="relative w-full max-w-3xl rounded-2xl border border-slate-800 bg-slate-900 shadow-2xl"
+      >
+        <header className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold text-slate-50">Save & Export</h2>
+            <p className="text-xs text-slate-400">
+              Your inputs already auto-save in this browser. Use these to keep versions or move data elsewhere.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+            aria-label="Close"
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="space-y-6 p-5">
+          <section>
+            <h3 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+              <Save size={13} /> Saved scenarios
+            </h3>
+            <form
+              className="flex flex-col gap-2 sm:flex-row"
+              onSubmit={(e) => {
+                e.preventDefault();
+                onSave(name);
+                setName('');
+              }}
+            >
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder={`e.g. "Maple St · ${fmt(state.rent)}"`}
+                className="flex-1 rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-600 focus:border-indigo-500"
+              />
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-indigo-500 px-4 py-2 text-sm font-medium text-white shadow hover:bg-indigo-400"
+              >
+                <Save size={14} /> Save current
+              </button>
+            </form>
+
+            {scenarios.length === 0 ? (
+              <div className="mt-3 rounded-xl border border-dashed border-slate-700 p-5 text-center text-sm text-slate-500">
+                No saved scenarios yet. Save one per apartment you're considering to compare them side by side.
+              </div>
+            ) : (
+              <div className="mt-3 overflow-x-auto">
+                <table className="w-full min-w-[620px] text-sm">
+                  <thead>
+                    <tr className="text-left text-[11px] uppercase tracking-wide text-slate-500">
+                      <th className="pb-2 font-medium">Scenario</th>
+                      <th className="pb-2 text-right font-medium">Rent</th>
+                      <th className="pb-2 text-right font-medium">Burden</th>
+                      <th className="pb-2 text-right font-medium">Surplus</th>
+                      <th className="pb-2" />
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/80">
+                    <tr className="bg-indigo-500/[0.06]">
+                      <td className="py-2 pl-2 text-slate-300">
+                        <span className="font-medium text-indigo-200">Current inputs</span>
+                      </td>
+                      <td className="py-2 text-right tabular-nums text-slate-200">{fmt(state.rent)}</td>
+                      <td className="py-2 text-right">
+                        <Badge tone={BURDEN_META[current.burdenTier].tone}>{pct(current.burden)}</Badge>
+                      </td>
+                      <td
+                        className={`py-2 text-right tabular-nums ${current.surplus >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}
+                      >
+                        {fmtSigned(current.surplus)}
+                      </td>
+                      <td />
+                    </tr>
+                    {scenarios.map((sc) => {
+                      const sm = computeModel(normalizeState(sc.state));
+                      return (
+                        <tr key={sc.id}>
+                          <td className="py-1.5 pr-2">
+                            <TextField value={sc.name} onChange={(v) => onRename(sc.id, v)} />
+                            <div className="px-2 text-[11px] text-slate-500">
+                              Saved {new Date(sc.savedAt).toLocaleString()}
+                            </div>
+                          </td>
+                          <td className="py-1.5 text-right tabular-nums text-slate-200">{fmt(sc.state.rent)}</td>
+                          <td className="py-1.5 text-right">
+                            <Badge tone={BURDEN_META[sm.burdenTier].tone}>{pct(sm.burden)}</Badge>
+                          </td>
+                          <td
+                            className={`py-1.5 text-right tabular-nums ${sm.surplus >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}
+                          >
+                            {fmtSigned(sm.surplus)}
+                          </td>
+                          <td className="py-1.5 pl-2">
+                            <div className="flex justify-end gap-1">
+                              <button
+                                type="button"
+                                onClick={() => onLoad(sc.id)}
+                                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-500/10"
+                              >
+                                <FolderOpen size={13} /> Load
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onOverwrite(sc.id)}
+                                title="Overwrite with current inputs"
+                                className="rounded-md p-1.5 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+                                aria-label={`Update ${sc.name}`}
+                              >
+                                <Check size={14} />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => onDelete(sc.id)}
+                                className="rounded-md p-1.5 text-slate-500 hover:bg-rose-500/10 hover:text-rose-300"
+                                aria-label={`Delete ${sc.name}`}
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+
+          <section>
+            <h3 className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+              <Download size={13} /> Export & share
+            </h3>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <ActionButton
+                icon={FileJson}
+                title="Download backup (.json)"
+                desc="Everything, including saved scenarios. Re-import on any device."
+                onClick={onExportJson}
+              />
+              <ActionButton
+                icon={Upload}
+                title="Import backup"
+                desc="Load a .json backup file you or your partner exported."
+                onClick={() => fileRef.current?.click()}
+              />
+              <ActionButton
+                icon={FileSpreadsheet}
+                title="Export spreadsheet (.csv)"
+                desc="Line items, transfers and summary for Excel or Google Sheets."
+                onClick={onExportCsv}
+              />
+              <ActionButton
+                icon={Printer}
+                title="Print / save as PDF"
+                desc="A clean, light-themed report for printing or PDF."
+                onClick={onPrint}
+              />
+              <ActionButton
+                icon={Share2}
+                title="Copy share link"
+                desc="The numbers live in the link itself — nothing is uploaded."
+                onClick={onCopyLink}
+              />
+            </div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) onImportJson(f);
+                e.target.value = '';
+              }}
+            />
+          </section>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -612,6 +1027,103 @@ export default function CoupleBudget() {
 
   const resetAll = () => {
     if (window.confirm('Reset every input back to the default scenario?')) setState(makeDefaults());
+  };
+
+  // ---- saving & exporting ----
+  const [scenarios, setScenarios] = useState(loadScenarios);
+  const [dataOpen, setDataOpen] = useState(false);
+  const [toast, setToast] = useState(null);
+  const [pendingShare, setPendingShare] = useState(null);
+  const closeData = React.useCallback(() => setDataOpen(false), []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(SCENARIOS_KEY, JSON.stringify(scenarios));
+    } catch {
+      /* ignore */
+    }
+  }, [scenarios]);
+
+  useEffect(() => {
+    if (!toast) return undefined;
+    const t = setTimeout(() => setToast(null), 3200);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // A share link puts the budget in the URL hash; ask before replacing local data with it.
+  useEffect(() => {
+    const hash = window.location.hash;
+    if (!hash.startsWith('#s=')) return;
+    try {
+      setPendingShare(normalizeState(decodeShare(hash.slice(3))));
+    } catch {
+      setToast({ tone: 'rose', text: 'That share link is invalid or incomplete.' });
+      clearHash();
+    }
+  }, []);
+
+  const saveScenario = (name) => {
+    const label = name.trim() || `${fmt(state.rent)} rent · ${new Date().toLocaleDateString()}`;
+    setScenarios((list) => [{ id: uid('sc'), name: label, savedAt: Date.now(), state }, ...list]);
+    setToast({ tone: 'emerald', text: `Saved "${label}"` });
+  };
+  const overwriteScenario = (id) => {
+    setScenarios((list) => list.map((sc) => (sc.id === id ? { ...sc, state, savedAt: Date.now() } : sc)));
+    setToast({ tone: 'emerald', text: 'Scenario updated with current inputs' });
+  };
+  const loadScenario = (id) => {
+    const sc = scenarios.find((s) => s.id === id);
+    if (!sc) return;
+    setState(normalizeState(sc.state));
+    setToast({ tone: 'indigo', text: `Loaded "${sc.name}"` });
+  };
+  const deleteScenario = (id) => {
+    const sc = scenarios.find((s) => s.id === id);
+    if (sc && window.confirm(`Delete saved scenario "${sc.name}"?`)) {
+      setScenarios((list) => list.filter((s) => s.id !== id));
+    }
+  };
+  const renameScenario = (id, name) => setScenarios((list) => list.map((sc) => (sc.id === id ? { ...sc, name } : sc)));
+
+  const exportJson = () => {
+    const payload = { app: EXPORT_APP, version: EXPORT_VERSION, exportedAt: new Date().toISOString(), state, scenarios };
+    downloadFile(`couple-budget-${dateStamp()}.json`, JSON.stringify(payload, null, 2), 'application/json');
+    setToast({ tone: 'emerald', text: 'Backup file downloaded' });
+  };
+  const importJson = async (file) => {
+    try {
+      const { state: imported, scenarios: importedScenarios } = parseImport(await file.text());
+      if (!window.confirm('Replace your current inputs with this backup? Saved scenarios in the file will be added.')) return;
+      setState(imported);
+      if (importedScenarios) {
+        setScenarios((list) => {
+          const ids = new Set(list.map((s) => s.id));
+          return [...importedScenarios.filter((s) => s && s.state && !ids.has(s.id)), ...list];
+        });
+      }
+      setToast({ tone: 'emerald', text: `Imported ${file.name}` });
+    } catch (e) {
+      setToast({ tone: 'rose', text: e instanceof SyntaxError ? 'That file is not valid JSON.' : e.message });
+    }
+  };
+  const exportCsv = () => {
+    downloadFile(`couple-budget-${dateStamp()}.csv`, buildCsv(state, m), 'text/csv;charset=utf-8');
+    setToast({ tone: 'emerald', text: 'CSV downloaded — opens in Excel or Google Sheets' });
+  };
+  const printReport = () => {
+    const w = window.open('', '_blank');
+    if (!w) return setToast({ tone: 'rose', text: 'Pop-up blocked — allow pop-ups to print the report.' });
+    w.document.write(buildReportHtml(state, m));
+    w.document.close();
+  };
+  const copyShareLink = async () => {
+    const url = `${window.location.origin}${window.location.pathname}#s=${encodeShare(state)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setToast({ tone: 'emerald', text: 'Share link copied — anyone with it sees these numbers' });
+    } catch {
+      window.prompt('Copy this link:', url);
+    }
   };
 
   const n1 = state.names.p1 || 'Partner 1';
@@ -1744,6 +2256,13 @@ export default function CoupleBudget() {
             </Badge>
             <button
               type="button"
+              onClick={() => setDataOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-full bg-indigo-500 px-3 py-1 text-[11px] font-semibold uppercase tracking-wide text-white shadow hover:bg-indigo-400"
+            >
+              <Save size={12} /> Save & Export
+            </button>
+            <button
+              type="button"
               onClick={resetAll}
               className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400 ring-1 ring-slate-800 hover:text-slate-200"
             >
@@ -1774,6 +2293,42 @@ export default function CoupleBudget() {
           </div>
         </nav>
 
+        {pendingShare && (
+          <div className="mb-6 flex flex-col gap-3 rounded-xl bg-indigo-500/10 px-4 py-3 text-sm text-indigo-100 ring-1 ring-indigo-500/30 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
+              <Share2 size={18} className="mt-0.5 shrink-0 text-indigo-300" />
+              <div>
+                This link contains a shared budget ({fmt(pendingShare.rent)} rent). Load it? Your current inputs will be
+                replaced — save them as a scenario first if you want to keep them.
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setState(pendingShare);
+                  setPendingShare(null);
+                  clearHash();
+                  setToast({ tone: 'indigo', text: 'Shared budget loaded' });
+                }}
+                className="rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400"
+              >
+                Load shared budget
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPendingShare(null);
+                  clearHash();
+                }}
+                className="rounded-lg px-3 py-1.5 text-xs font-medium text-slate-300 ring-1 ring-slate-700 hover:text-white"
+              >
+                Ignore
+              </button>
+            </div>
+          </div>
+        )}
+
         {deficits.length > 0 && (
           <div className="mb-6 flex items-start gap-3 rounded-xl bg-rose-500/10 px-4 py-3 text-sm text-rose-200 ring-1 ring-rose-500/30">
             <AlertTriangle size={18} className="mt-0.5 shrink-0 text-rose-300" />
@@ -1791,6 +2346,42 @@ export default function CoupleBudget() {
           this browser.
         </footer>
       </div>
+
+      {dataOpen && (
+        <DataPanel
+          state={state}
+          scenarios={scenarios}
+          onClose={closeData}
+          onSave={saveScenario}
+          onLoad={loadScenario}
+          onOverwrite={overwriteScenario}
+          onDelete={deleteScenario}
+          onRename={renameScenario}
+          onExportJson={exportJson}
+          onImportJson={importJson}
+          onExportCsv={exportCsv}
+          onPrint={printReport}
+          onCopyLink={copyShareLink}
+        />
+      )}
+
+      {toast && (
+        <div className="fixed inset-x-0 bottom-6 z-[60] flex justify-center px-4">
+          <div
+            role="status"
+            className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium shadow-2xl ring-1 backdrop-blur ${
+              {
+                emerald: 'bg-emerald-950/90 text-emerald-200 ring-emerald-500/40',
+                indigo: 'bg-indigo-950/90 text-indigo-200 ring-indigo-500/40',
+                rose: 'bg-rose-950/90 text-rose-200 ring-rose-500/40',
+              }[toast.tone]
+            }`}
+          >
+            {toast.tone === 'rose' ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}
+            {toast.text}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -7,7 +7,13 @@ A single-file React app (`src/CoupleBudget.jsx`) for an unmarried couple renting
 - **Shared Budget**: linked 50/30/20 sliders and an editable joint-account line-item table
 - **Personal**: each partner's own budget, cash-flow breakdown, and unallocated buffer
 
-Inputs are saved in `localStorage`.
+Inputs auto-save in the browser (`localStorage`). The **Save & Export** button in the header adds:
+
+- **Saved scenarios**: named snapshots (one per apartment, say), compared side by side by rent, burden and surplus
+- **Backup (.json)**: export everything, including scenarios, and import it on another browser or device
+- **Spreadsheet (.csv)**: line items, transfers, summary and 50/30/20 for Excel or Google Sheets
+- **Print / PDF**: a light-themed report that opens the print dialog
+- **Share link**: the whole budget is encoded in the link's `#` fragment, which browsers never send to a server; opening it asks before replacing local data
 
 ```bash
 npm install
